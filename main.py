@@ -38,8 +38,6 @@ def main():
     gerar_sumario(df)
     calcular_outliers(df, coluna='Global_active_power')
     gerar_tabela_dinamica(df, coluna='Global_active_power')
-    
-    print("\nFim da análise da Parte 1!")
 
 if __name__ == "__main__":
     main()
