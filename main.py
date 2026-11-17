@@ -5,7 +5,7 @@ warnings.filterwarnings('ignore') # Ocultar avisos do pandas para manter a conso
 
 from src.carregamento import carregar_dados
 from src.auditoria import analisar_missing_values
-from src.estatistica import gerar_sumario, calcular_outliers, gerar_tabela_dinamica
+from src.estatistica import remover_outliers, gerar_sumario, gerar_tabela_dinamica
 
 def main():
     print("=======================================")
@@ -34,10 +34,11 @@ def main():
     analisar_missing_values(df)
     
     # 3. Estatística e Outliers
-    print("\n[Passo 3] Exploração Estatística e Anomalias...")
-    gerar_sumario(df)
-    calcular_outliers(df, coluna='Global_active_power')
-    gerar_tabela_dinamica(df, coluna='Global_active_power')
+    print("\n[Passo 3] Remoção de Outliers e Análise Estatística...")
+    df_sem_outliers = remover_outliers(df, coluna='Global_active_power', metodo='iqr')
+    
+    gerar_sumario(df_sem_outliers)
+    gerar_tabela_dinamica(df_sem_outliers, coluna='Global_active_power')
 
 if __name__ == "__main__":
     main()
