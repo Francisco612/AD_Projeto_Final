@@ -8,12 +8,12 @@ from sklearn.manifold import TSNE
 def analisar_reducao_dimensao(df_clean):
     print("\n--- [2.2] Perfis Diários com Redução de Dimensão (PCA vs. t-SNE) ---")
 
-    # 1. Matriz de perfis diários (N_dias x 24 horas)
+    # 1. Matriz de perfis diários (N_dias x 24 horas) usando a MEDIANA horária
     df_h = df_clean[['Global_active_power']].copy()
     df_h['Data'] = df_h.index.date
     df_h['Hora'] = df_h.index.hour
 
-    matriz_perfis = df_h.pivot_table(index='Data', columns='Hora', values='Global_active_power', aggfunc='mean')
+    matriz_perfis = df_h.pivot_table(index='Data', columns='Hora', values='Global_active_power', aggfunc='median')
     dias_antes = len(matriz_perfis)
     matriz_perfis.dropna(inplace=True)
     print(f"Matriz construída: {len(matriz_perfis)} dias completos x 24 horas (excluídos {dias_antes - len(matriz_perfis)} dias incompletos).")
@@ -35,11 +35,16 @@ def analisar_reducao_dimensao(df_clean):
     pca = PCA(n_components=24, random_state=42)
     X_pca = pca.fit_transform(X_scaled)
 
+    # Garantir que PC1 alto representa consumo elevado
+    if pca.components_[0].sum() < 0:
+        pca.components_[0] *= -1
+        X_pca[:, 0] *= -1
+
     var_exp = pca.explained_variance_ratio_ * 100
     var_cum = np.cumsum(var_exp)
     print(f"Variância explicada -> PC1: {var_exp[0]:.2f}% | PC2: {var_exp[1]:.2f}% | PC3: {var_exp[2]:.2f}% (Acumulado: {var_cum[2]:.2f}%)")
 
-    # FIGURA 6: Scree Plot + Loadings (PC1, PC2, PC3)
+    # FIGURA 6: Scree Plot + Loadings
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 4.8))
     comps = np.arange(1, 25)
     ax1.bar(comps, var_exp, color='#3498db', alpha=0.8, label='Variância Individual (%)')
@@ -47,7 +52,7 @@ def analisar_reducao_dimensao(df_clean):
     ax1.axhline(80, color='#2c3e50', linestyle='--', linewidth=1.2, label='Limiar 80%')
     ax1.set_ylim(0, 105)
     ax1.set_xticks(range(1, 25, 2))
-    ax1.set_title('Scree Plot: PC1 a PC3 concentram a estrutura dominante do consumo', fontsize=11.5, fontweight='bold', loc='left')
+    ax1.set_title('Scree Plot: PC1 a PC3 concentram a estrutura dominante dos perfis diários', fontsize=11.5, fontweight='bold', loc='left')
     ax1.set_xlabel('Componente Principal')
     ax1.set_ylabel('Variância Explicada (%)')
     ax1.legend(loc='center right')
