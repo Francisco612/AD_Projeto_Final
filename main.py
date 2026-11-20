@@ -50,8 +50,15 @@ def main():
 
     print("\n[Parte 2.2] Perfis Diários com Redução de Dimensão (PCA vs. t-SNE)...")
     analisar_reducao_dimensao(df_clean)
-    
-    print("\nExecução concluída com sucesso!")
+
+    # --- PARTE III ---
+    print("\n[Parte 3.1] Engenharia de Variáveis Causais (Sem Fuga Temporal)...")
+    X, y = preparar_dataset_diario_causal(df_clean, carga_basal_kw)
+
+    print("\n[Parte 3.2] Seleção Comparada dentro de Pipeline + TimeSeriesSplit...")
+    executar_selecao_comparada(X, y, carga_basal_kw)
+
+    print("\nExecução completa concluída com sucesso!")
 
 if __name__ == "__main__":
     main()
