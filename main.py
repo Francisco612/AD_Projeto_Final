@@ -60,5 +60,9 @@ def main():
 
     print("\nExecução completa concluída com sucesso!")
 
+
+from src.streaming import processar_fluxo_tempo_real, inspecionar_5_alarmes
+df_stream, df_15m, df_drifts, df_alarmes, resumo_welford = processar_fluxo_tempo_real(df_clean)
+
 if __name__ == "__main__":
     main()
