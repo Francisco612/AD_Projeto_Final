@@ -1,4 +1,3 @@
-import os
 from collections import deque
 from pathlib import Path
 import numpy as np
@@ -6,39 +5,56 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from sklearn.linear_model import LinearRegression, LassoCV
 from sklearn.feature_selection import SelectFromModel
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
 
-# Configuração da página
+# ==============================================================================
+# CONFIGURAÇÃO DA PÁGINA E ESTILO EXECUTIVO
+# ==============================================================================
 st.set_page_config(
-    page_title="LusoEnergia — Plataforma de Gestão & Controlo",
+    page_title="LusoEnergia — Portal Comercial & Sala de Controlo",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+        .block-container { padding-top: 1.3rem; padding-bottom: 2rem; }
+        div[data-testid="stMetric"] {
+            background-color: rgba(128, 128, 128, 0.06);
+            border: 1px solid rgba(128, 128, 128, 0.18);
+            padding: 12px 16px;
+            border-radius: 10px;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 SOMA_ALUNOS = 101833
 
+# Tarifário de referência residencial (Portugal - €/kWh sem IVA)
+TARIFA_SIMPLES = 0.215
+TARIFA_FORA_VAZIO = 0.265  # 08:00 às 22:00
+TARIFA_VAZIO = 0.118       # 22:00 às 08:00
 
+
+# ==============================================================================
+# 1. LOCALIZAÇÃO E PREPARAÇÃO DOS DADOS (COM CACHE)
+# ==============================================================================
 def encontrar_dataset():
-    """Procura automaticamente o ficheiro ZIP ou TXT do dataset em data/raw e subpastas."""
-    base_script = Path(__file__).resolve().parent
-    caminhos_diretos = [
-        Path.cwd() / "data" / "raw" / "individual+household+electric+power+consumption.zip",
-        base_script / "data" / "raw" / "individual+household+electric+power+consumption.zip",
-        base_script.parent / "data" / "raw" / "individual+household+electric+power+consumption.zip",
-    ]
-    for c in caminhos_diretos:
-        if c.exists():
-            return str(c)
-
-    raizes = [Path.cwd(), base_script, base_script.parent]
-    for raiz in raizes:
+    """Procura automaticamente o ficheiro ZIP ou TXT do dataset no projeto."""
+    base = Path(__file__).resolve().parent
+    for raiz in [Path.cwd(), base, base.parent]:
         if raiz.exists():
             for padrao in ("*.zip", "*.txt"):
                 for fich in raiz.rglob(padrao):
@@ -48,54 +64,59 @@ def encontrar_dataset():
     return None
 
 
-# ==============================================================================
-# 1. CARREGAMENTO E PREPARAÇÃO DOS DADOS (COM CACHE PARA RAPIDEZ)
-# ==============================================================================
-@st.cache_data(show_spinner="A carregar e preparar a janela de 18 meses...")
+@st.cache_data(show_spinner="A preparar indicadores comerciais e operacionais (18 meses)...")
 def carregar_dados_grupo(fonte):
     df_raw = pd.read_csv(
         fonte,
         sep=";",
         na_values=["?", "nan", "NaN", ""],
-        low_memory=False
+        low_memory=False,
     )
 
-    dt = pd.to_datetime(df_raw["Date"] + " " + df_raw["Time"], format="%d/%m/%Y %H:%M:%S")
-    df_raw = df_raw.drop(columns=["Date", "Time"])
-    df_raw.index = dt
-    df_raw = df_raw.sort_index()
+    df_raw.index = pd.to_datetime(
+        df_raw["Date"] + " " + df_raw["Time"],
+        format="%d/%m/%Y %H:%M:%S",
+    )
+    df_raw = df_raw.drop(columns=["Date", "Time"]).sort_index()
 
-    # Converter colunas para numérico
     for col in df_raw.columns:
         df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce")
 
-    # Reindexar para garantir grelha contínua de 1 minuto
-    grelha_completa = pd.date_range(df_raw.index.min(), df_raw.index.max(), freq="1min")
-    df_raw = df_raw.reindex(grelha_completa)
+    grelha = pd.date_range(df_raw.index.min(), df_raw.index.max(), freq="1min")
+    df_raw = df_raw.reindex(grelha)
 
-    # Selecionar janela determinística de 18 meses do grupo
+    # Janela determinística de 18 meses do grupo
     meses_unicos = df_raw.index.to_period("M").unique()
-    total_meses = len(meses_unicos)
-    max_inicio = max(1, total_meses - 18)
-    idx_inicio = SOMA_ALUNOS % max_inicio
+    idx_inicio = SOMA_ALUNOS % max(1, len(meses_unicos) - 18)
     meses_grupo = meses_unicos[idx_inicio : idx_inicio + 18]
+    df_bruto = df_raw.loc[df_raw.index.to_period("M").isin(meses_grupo)].copy()
 
-    mask_grupo = df_raw.index.to_period("M").isin(meses_grupo)
-    df_bruto_grupo = df_raw.loc[mask_grupo].copy()
+    # Qualidade dos dados brutos
+    pct_missing = float(df_bruto["Global_active_power"].isna().mean() * 100.0)
+    leituras_dia = df_bruto["Global_active_power"].resample("D").count()
+    dias_sem_leituras = int((leituras_dia == 0).sum())
+    dias_incompletos = int((leituras_dia < 1200).sum())
 
-    # Métricas de qualidade ANTES da interpolação
-    pct_missing = float(df_bruto_grupo["Global_active_power"].isna().mean() * 100.0)
-    leituras_por_dia = df_bruto_grupo["Global_active_power"].resample("D").count()
-    dias_sem_leituras = int((leituras_por_dia == 0).sum())
-    dias_incompletos = int((leituras_por_dia < 1200).sum())
-
-    # Interpolação curta (até 60 min) igual às Partes I, II e III
-    df_clean = df_bruto_grupo.interpolate(method="time", limit=60)
-
-    # Variáveis derivadas físicas
+    # Interpolação curta (até 60 min)
+    df_clean = df_bruto.interpolate(method="time", limit=60)
     df_clean["Energia_Total_Wh"] = (df_clean["Global_active_power"] * 1000.0) / 60.0
-    soma_subs = df_clean["Sub_metering_1"] + df_clean["Sub_metering_2"] + df_clean["Sub_metering_3"]
+    soma_subs = (
+        df_clean["Sub_metering_1"]
+        + df_clean["Sub_metering_2"]
+        + df_clean["Sub_metering_3"]
+    )
     df_clean["Sub_outros_Wh"] = (df_clean["Energia_Total_Wh"] - soma_subs).clip(lower=0)
+
+    # Indicadores de horário vazio (22h - 08h) vs. fora de vazio (08h - 22h)
+    is_vazio = (df_clean.index.hour >= 22) | (df_clean.index.hour < 8)
+    energia_total_kwh = float(df_clean["Energia_Total_Wh"].sum() / 1000.0)
+    energia_vazio_kwh = float(df_clean.loc[is_vazio, "Energia_Total_Wh"].sum() / 1000.0)
+    energia_fora_vazio_kwh = energia_total_kwh - energia_vazio_kwh
+    pct_vazio = (energia_vazio_kwh / max(energia_total_kwh, 1.0)) * 100.0
+
+    # Custos comparativos (Simples vs. Bi-Horária)
+    custo_simples_total = energia_total_kwh * TARIFA_SIMPLES
+    custo_bihoraria_total = (energia_vazio_kwh * TARIFA_VAZIO) + (energia_fora_vazio_kwh * TARIFA_FORA_VAZIO)
 
     carga_basal_kw = float(df_clean["Global_active_power"].quantile(0.10))
     energia_basal_kwh_dia = carga_basal_kw * 24.0
@@ -110,11 +131,11 @@ def carregar_dados_grupo(fonte):
     df_diario["Energia_Variavel_kWh"] = (df_diario["Energia_Total_kWh"] - energia_basal_kwh_dia).clip(lower=0)
     df_diario["Voltage_Media"] = df_clean["Voltage"].resample("D").mean()
     df_diario["Reactive_Media"] = df_clean["Global_reactive_power"].resample("D").mean()
+    df_diario["Pico_Diario_kW"] = df_clean["Global_active_power"].resample("D").max()
 
-    meta_qualidade = {
+    meta = {
         "inicio": str(df_clean.index.min().date()),
         "fim": str(df_clean.index.max().date()),
-        "total_dias": len(df_diario),
         "consumo_medio_diario": float(df_diario["Energia_Total_kWh"].mean()),
         "consumo_mediano_diario": float(df_diario["Energia_Total_kWh"].median()),
         "pct_missing": pct_missing,
@@ -122,27 +143,99 @@ def carregar_dados_grupo(fonte):
         "dias_incompletos": dias_incompletos,
         "carga_basal_kw": carga_basal_kw,
         "energia_basal_kwh_dia": energia_basal_kwh_dia,
-        "leituras_por_dia": leituras_por_dia,
+        "leituras_dia": leituras_dia,
+        "pct_vazio": pct_vazio,
+        "custo_mensal_simples": custo_simples_total / 18.0,
+        "custo_mensal_bihoraria": custo_bihoraria_total / 18.0,
+        "poupanca_anual_bihoraria": ((custo_simples_total - custo_bihoraria_total) / 18.0) * 12.0,
     }
-
-    return df_clean, df_diario, meta_qualidade
+    return df_clean, df_diario, meta
 
 
 # ==============================================================================
-# 2. MODELO PREDITIVO DA PARTE III (CACHE)
+# 2. PROJEÇÃO 2D DOS PERFIS DIÁRIOS (PCA & t-SNE COM CACHE)
 # ==============================================================================
-@st.cache_data(show_spinner="A executar validação temporal da Parte III...")
+@st.cache_data(show_spinner="A calcular mapa de perfis diários...")
+def calcular_projecao_2d(df_clean, df_diario, metodo="PCA", perplexity=30):
+    df_perf = df_clean[["Global_active_power"]].copy()
+    df_perf["Data"] = df_perf.index.date
+    df_perf["Hora"] = df_perf.index.hour
+    mat_24h = df_perf.pivot_table(
+        index="Data", columns="Hora", values="Global_active_power", aggfunc="median"
+    ).dropna()
+
+    X_scaled = StandardScaler().fit_transform(mat_24h.values)
+    idx_datas = pd.to_datetime(mat_24h.index)
+    dias_pt = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado", "Domingo"]
+    tipo_dia = np.where(idx_datas.dayofweek >= 5, "Fim de Semana", "Dia Útil")
+
+    if metodo == "PCA":
+        modelo = PCA(n_components=2, random_state=42)
+        coords = modelo.fit_transform(X_scaled)
+        var_exp = modelo.explained_variance_ratio_ * 100
+        eixo_x = f"Componente 1 ({var_exp[0]:.1f}% variância)"
+        eixo_y = f"Componente 2 ({var_exp[1]:.1f}% variância)"
+    else:
+        perp_segura = min(perplexity, max(5, len(X_scaled) - 1))
+        modelo = TSNE(
+            n_components=2,
+            perplexity=perp_segura,
+            random_state=42,
+            init="pca",
+            learning_rate="auto",
+        )
+        coords = modelo.fit_transform(X_scaled)
+        eixo_x = "Dimensão t-SNE 1 (Vizinhança Local)"
+        eixo_y = "Dimensão t-SNE 2 (Vizinhança Local)"
+
+    df_plot = pd.DataFrame({
+        "Dim1": coords[:, 0],
+        "Dim2": coords[:, 1],
+        "Data": idx_datas.strftime("%Y-%m-%d"),
+        "Tipo de Dia": tipo_dia,
+        "Dia da Semana": [dias_pt[d] for d in idx_datas.dayofweek],
+        "Consumo (kWh)": df_diario.reindex(idx_datas)["Energia_Total_kWh"].round(2).values,
+    })
+    return df_plot, mat_24h, tipo_dia, eixo_x, eixo_y
+
+
+# ==============================================================================
+# 3. MODELO PREDITIVO DA PARTE III (COM CACHE)
+# ==============================================================================
+NOMES_NEGOCIO_VARS = {
+    "lag_1": "Consumo de Ontem",
+    "lag_2": "Consumo há 2 Dias",
+    "lag_3": "Consumo há 3 Dias",
+    "lag_7": "Mesmo Dia da Semana Passada",
+    "sub1_cozinha_lag1": "Cozinha Ontem (Sub 1)",
+    "sub2_lavandaria_lag1": "Lavandaria Ontem (Sub 2)",
+    "sub3_climatizacao_lag1": "Climatização / Águas Ontem (Sub 3)",
+    "sub_outros_lag1": "Restante Habitação Ontem (Outros)",
+    "energia_variavel_lag1": "Consumo Variável Ontem",
+    "voltage_lag1": "Tensão Média da Rede Ontem",
+    "reactive_lag1": "Potência Reativa Ontem",
+    "roll_mean_3": "Média dos Últimos 3 Dias",
+    "roll_mean_7": "Média da Última Semana",
+    "roll_median_7": "Mediana da Última Semana",
+    "roll_std_7": "Variabilidade Semanal",
+    "roll_mean_14": "Média das Últimas 2 Semanas",
+    "dia_semana": "Dia da Semana",
+    "is_fim_de_semana": "Fim de Semana",
+    "mes": "Mês do Ano",
+    "is_feriado": "Feriado Nacional",
+    "mes_sin": "Ciclo Sazonal (Seno)",
+    "mes_cos": "Ciclo Sazonal (Cosseno)",
+}
+
+
+@st.cache_data(show_spinner="A calcular previsões e erros por período...")
 def executar_modelo_parte3(df_diario):
     dados = pd.DataFrame(index=df_diario.index)
-    dados["Target_Energia_kWh"] = df_diario["Energia_Total_kWh"]
+    dados["Target"] = df_diario["Energia_Total_kWh"]
 
-    # Lags
-    dados["lag_1"] = df_diario["Energia_Total_kWh"].shift(1)
-    dados["lag_2"] = df_diario["Energia_Total_kWh"].shift(2)
-    dados["lag_3"] = df_diario["Energia_Total_kWh"].shift(3)
-    dados["lag_7"] = df_diario["Energia_Total_kWh"].shift(7)
+    for lag in (1, 2, 3, 7):
+        dados[f"lag_{lag}"] = df_diario["Energia_Total_kWh"].shift(lag)
 
-    # Circuitos ontem
     dados["sub1_cozinha_lag1"] = df_diario["Sub1_Cozinha_kWh"].shift(1)
     dados["sub2_lavandaria_lag1"] = df_diario["Sub2_Lavandaria_kWh"].shift(1)
     dados["sub3_climatizacao_lag1"] = df_diario["Sub3_Climatizacao_kWh"].shift(1)
@@ -151,7 +244,6 @@ def executar_modelo_parte3(df_diario):
     dados["voltage_lag1"] = df_diario["Voltage_Media"].shift(1)
     dados["reactive_lag1"] = df_diario["Reactive_Media"].shift(1)
 
-    # Janelas móveis causais (shift antes do rolling)
     passado = df_diario["Energia_Total_kWh"].shift(1)
     dados["roll_mean_3"] = passado.rolling(3, min_periods=2).mean()
     dados["roll_mean_7"] = passado.rolling(7, min_periods=5).mean()
@@ -159,7 +251,6 @@ def executar_modelo_parte3(df_diario):
     dados["roll_std_7"] = passado.rolling(7, min_periods=5).std()
     dados["roll_mean_14"] = passado.rolling(14, min_periods=10).mean()
 
-    # Calendário
     try:
         import holidays
         anos = list(range(df_diario.index.year.min(), df_diario.index.year.max() + 1))
@@ -175,9 +266,9 @@ def executar_modelo_parte3(df_diario):
     dados["mes_sin"] = np.sin(2 * np.pi * dados["mes"] / 12.0)
     dados["mes_cos"] = np.cos(2 * np.pi * dados["mes"] / 12.0)
 
-    dados_validos = dados.dropna().copy()
-    X = dados_validos.drop(columns=["Target_Energia_kWh"])
-    y = dados_validos["Target_Energia_kWh"]
+    validos = dados.dropna().copy()
+    X = validos.drop(columns=["Target"])
+    y = validos["Target"]
 
     tscv = TimeSeriesSplit(n_splits=5)
     pipe_lasso = Pipeline([
@@ -185,500 +276,692 @@ def executar_modelo_parte3(df_diario):
         ("selector", SelectFromModel(
             LassoCV(alphas=np.logspace(-2, 0.3, 30), cv=TimeSeriesSplit(n_splits=3), random_state=42, max_iter=10000)
         )),
-        ("regressor", LinearRegression())
+        ("regressor", LinearRegression()),
     ])
 
-    metricas_folds = []
-    previsoes_oos = []
+    metricas, preds = [], []
     selecoes = pd.DataFrame(0, index=X.columns, columns=[f"Fold {i+1}" for i in range(5)])
 
-    for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
-        X_va, y_va = X.iloc[val_idx], y.iloc[val_idx]
+    for i, (tr_idx, va_idx) in enumerate(tscv.split(X)):
+        X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
+        X_va, y_va = X.iloc[va_idx], y.iloc[va_idx]
 
         pipe_lasso.fit(X_tr, y_tr)
         y_pred = pipe_lasso.predict(X_va)
         y_base = X_va["lag_1"].values
 
         suporte = pipe_lasso.named_steps["selector"].get_support()
-        selecoes.iloc[:, fold_idx] = suporte.astype(int)
+        selecoes.iloc[:, i] = suporte.astype(int)
 
-        periodo_str = f"{y_va.index.min().strftime('%Y-%m-%d')} a {y_va.index.max().strftime('%Y-%m-%d')}"
-        metricas_folds.append({
-            "Período (Fold)": f"Fold {fold_idx+1} ({periodo_str})",
+        nome_periodo = f"Trimestre Validação {i+1}"
+        intervalo_str = f"{y_va.index.min().strftime('%d/%m/%Y')} a {y_va.index.max().strftime('%d/%m/%Y')}"
+        metricas.append({
+            "Período": nome_periodo,
+            "Datas": intervalo_str,
             "MAE Modelo (kWh)": round(mean_absolute_error(y_va, y_pred), 2),
             "MAE Baseline (kWh)": round(mean_absolute_error(y_va, y_base), 2),
-            "RMSE Modelo (kWh)": round(root_mean_squared_error(y_va, y_pred), 2),
-            "R2 Modelo": round(r2_score(y_va, y_pred), 3),
-            "Nº Variáveis": int(suporte.sum())
+            "RMSE (kWh)": round(root_mean_squared_error(y_va, y_pred), 2),
+            "R²": round(r2_score(y_va, y_pred), 3),
         })
 
-        df_fold_pred = pd.DataFrame({
+        preds.append(pd.DataFrame({
             "Data": y_va.index,
             "Real_kWh": y_va.values,
-            "Previsto_Lasso_kWh": y_pred,
-            "Baseline_Ontem_kWh": y_base,
-            "Fold": f"Fold {fold_idx+1}"
-        })
-        previsoes_oos.append(df_fold_pred)
+            "Previsto_kWh": y_pred,
+            "Baseline_kWh": y_base,
+            "Período": nome_periodo,
+        }))
 
-    df_metricas = pd.DataFrame(metricas_folds)
-    df_preds = pd.concat(previsoes_oos, ignore_index=True)
-    freq_selecao = (selecoes.mean(axis=1) * 100).sort_values(ascending=False)
+    df_metricas = pd.DataFrame(metricas)
+    df_preds = pd.concat(preds, ignore_index=True)
 
-    return df_metricas, df_preds, freq_selecao
+    freq = (selecoes.mean(axis=1) * 100).sort_values(ascending=False)
+    df_vars = pd.DataFrame({
+        "Variável": [NOMES_NEGOCIO_VARS.get(c, c) for c in freq.index],
+        "Importância (%)": freq.values,
+    })
+
+    return df_metricas, df_preds, df_vars
 
 
 # ==============================================================================
-# 3. REPLAY DE STREAMING DA PARTE IV (ELEMENTO A ELEMENTO)
+# 4. REPLAY EM TEMPO REAL O(1) COM DIAGNÓSTICO AUTOMÁTICO DE CAUSA RAIZ
 # ==============================================================================
-@st.cache_data(show_spinner="A simular fluxo em tempo real (Welford + EWMA + Z-Score)...")
-def executar_replay_streaming(df_clean, dia_selecionado_str, janela_min, limiar_z):
-    timestamps_raw = df_clean.index.to_numpy()
-    valores_raw = df_clean["Global_active_power"].to_numpy(dtype=float)
+def diagnosticar_causa_alarme(x_kw, sub1_wh, sub2_wh, sub3_wh, sub_out_wh, pot_contratada_kw):
+    """Identifica automaticamente o circuito dominante ou sobrecarga no minuto do alarme."""
+    prefixo = "⚡ Risco Disjuntor (> Pot. Contratada) | " if x_kw > pot_contratada_kw else ""
+
+    circuitos = {
+        "🍳 Cozinha (Forno/Loiça)": sub1_wh,
+        "🧺 Lavandaria (Máq. Roupa)": sub2_wh,
+        "🌡️ Climatização / Termoacumulador": sub3_wh,
+        "🔌 Circuito Geral / Frio": sub_out_wh,
+    }
+    dominante = max(circuitos, key=circuitos.get)
+    valor_dom = circuitos[dominante]
+
+    ativos = [nome for nome, val in list(circuitos.items())[:3] if val >= 15]
+    if len(ativos) >= 2:
+        return prefixo + "Uso Simultâneo: " + " + ".join(ativos)
+    if valor_dom < 12 and x_kw < 1.6:
+        return "❄️ Arranque Normal de Compressor (Baixa Variância)"
+    return prefixo + dominante
+
+
+@st.cache_data(show_spinner="A processar fluxo em tempo real...")
+def executar_replay_streaming(df_clean, dia_str, janela_min, limiar_z, pot_contratada_kw):
+    ts_sec_arr = df_clean.index.to_numpy().astype("datetime64[s]").astype(np.int64)
+    val_arr = df_clean["Global_active_power"].to_numpy(dtype=float)
+    s1_arr = df_clean["Sub_metering_1"].to_numpy(dtype=float)
+    s2_arr = df_clean["Sub_metering_2"].to_numpy(dtype=float)
+    s3_arr = df_clean["Sub_metering_3"].to_numpy(dtype=float)
+    sout_arr = df_clean["Sub_outros_Wh"].to_numpy(dtype=float)
+
+    dia_ini_sec = int(pd.Timestamp(dia_str).value // 10**9)
+    dia_fim_sec = dia_ini_sec + 86400
 
     n_welford = 0
     mean_welford = 0.0
     m2_welford = 0.0
 
     janela = deque(maxlen=janela_min)
-    soma_janela = 0.0
+    soma_win = 0.0
+    soma_sq_win = 0.0
 
     alpha = 2.0 / (janela_min + 1.0)
     ewma_val = None
 
-    total_alarmes_globais = 0
-    ultimo_alarme_global = None
+    total_eventos_alarme = 0
+    ultimo_alarme_sec = -999999
+    dias_com_alarme_set = set()
 
-    dia_alvo = pd.to_datetime(dia_selecionado_str).date()
-    ts_dia, raw_dia, win_dia, ewma_dia, z_dia, is_alarme_dia = [], [], [], [], [], []
-    alarmes_dia_lista = []
+    ts_dia, raw_dia, win_dia, ewma_dia, z_dia, alarme_dia, causa_dia = [], [], [], [], [], [], []
+    lista_alarmes_dia = []
 
-    for ts, x in zip(timestamps_raw, valores_raw):
+    min_amostras_z = max(10, janela_min // 2)
+
+    for ts_sec, x, s1, s2, s3, sout in zip(ts_sec_arr, val_arr, s1_arr, s2_arr, s3_arr, sout_arr):
         if np.isnan(x):
             continue
 
-        ts_pd = pd.Timestamp(ts)
-
-        # Avaliar Z-Score ANTES de atualizar a janela (sem contaminação)
         z_atual = 0.0
         disparou = False
-        if len(janela) >= max(10, janela_min // 2):
-            mu_loc = soma_janela / len(janela)
-            var_loc = sum((v - mu_loc) ** 2 for v in janela) / (len(janela) - 1)
-            std_loc = max(np.sqrt(var_loc), 0.02)
-            z_atual = (x - mu_loc) / std_loc
-            if abs(z_atual) > limiar_z:
-                disparou = True
-                if ultimo_alarme_global is None or (ts_pd - ultimo_alarme_global).total_seconds() >= 3600:
-                    total_alarmes_globais += 1
-                    ultimo_alarme_global = ts_pd
+        causa_txt = ""
+        n_win = len(janela)
 
-        # Welford online
+        if n_win >= min_amostras_z:
+            mu_loc = soma_win / n_win
+            var_loc = max(0.0, (soma_sq_win - (soma_win * soma_win) / n_win) / (n_win - 1))
+            std_loc = max(np.sqrt(var_loc), 0.03)
+            z_atual = (x - mu_loc) / std_loc
+
+            if z_atual > limiar_z:
+                disparou = True
+                causa_txt = diagnosticar_causa_alarme(x, s1, s2, s3, sout, pot_contratada_kw)
+                if ts_sec - ultimo_alarme_sec >= 3600:
+                    total_eventos_alarme += 1
+                    ultimo_alarme_sec = ts_sec
+                    dias_com_alarme_set.add(int(ts_sec // 86400))
+
         n_welford += 1
         delta = x - mean_welford
         mean_welford += delta / n_welford
         delta2 = x - mean_welford
         m2_welford += delta * delta2
 
-        # Janela deslizante O(1)
-        if len(janela) == janela_min:
-            soma_janela -= janela[0]
+        if n_win == janela_min:
+            antigo = janela[0]
+            soma_win -= antigo
+            soma_sq_win -= antigo * antigo
         janela.append(x)
-        soma_janela += x
-        media_win = soma_janela / len(janela)
+        soma_win += x
+        soma_sq_win += x * x
+        media_win = soma_win / len(janela)
 
-        # EWMA online
         ewma_val = x if ewma_val is None else (alpha * x + (1.0 - alpha) * ewma_val)
 
-        # Registar apenas o dia escolhido para visualização detalhada
-        if ts_pd.date() == dia_alvo:
+        if dia_ini_sec <= ts_sec < dia_fim_sec:
+            ts_pd = pd.Timestamp(ts_sec, unit="s")
             ts_dia.append(ts_pd)
             raw_dia.append(x)
             win_dia.append(media_win)
             ewma_dia.append(ewma_val)
             z_dia.append(z_atual)
-            is_alarme_dia.append(disparou)
+            alarme_dia.append(disparou)
+            causa_dia.append(causa_txt)
             if disparou:
-                alarmes_dia_lista.append({
+                lista_alarmes_dia.append({
                     "Hora": ts_pd.strftime("%H:%M"),
-                    "Potência (kW)": round(x, 3),
-                    "Média Janela (kW)": round(media_win, 3),
-                    "Z-Score": round(z_atual, 2)
+                    "Potência (kW)": round(x, 2),
+                    "Referência (kW)": round(media_win, 2),
+                    "Z-Score": round(z_atual, 1),
+                    "Causa Provável": causa_txt,
                 })
 
     var_welford = m2_welford / max(1, n_welford - 1)
+    dias_com_alarme = sorted(
+        str(pd.Timestamp(d * 86400, unit="s").date()) for d in dias_com_alarme_set
+    )
 
-    df_dia_stream = pd.DataFrame({
+    df_dia = pd.DataFrame({
         "Timestamp": ts_dia,
         "Bruto_kW": raw_dia,
         "Janela_kW": win_dia,
         "EWMA_kW": ewma_dia,
         "Z_Score": z_dia,
-        "Alarme": is_alarme_dia
+        "Alarme": alarme_dia,
+        "Causa": causa_dia,
     })
 
     return {
-        "n_leituras": n_welford,
         "mean_welford": mean_welford,
         "var_welford": var_welford,
-        "total_alarmes_globais": total_alarmes_globais,
-        "df_dia": df_dia_stream,
-        "alarmes_dia": pd.DataFrame(alarmes_dia_lista)
+        "total_eventos": total_eventos_alarme,
+        "dias_com_alarme": dias_com_alarme,
+        "df_dia": df_dia,
+        "tabela_alarmes_dia": pd.DataFrame(lista_alarmes_dia),
     }
 
 
 # ==============================================================================
-# INTERFACE PRINCIPAL DO DASHBOARD
+# BARRA LATERAL (NAVEGAÇÃO + PARÂMETROS COMERCIAIS DO CLIENTE)
 # ==============================================================================
-st.sidebar.title("⚡ LusoEnergia")
-st.sidebar.caption("Gestão Comercial & Sala de Controlo")
-st.sidebar.markdown("---")
+fonte_dados = encontrar_dataset()
 
-uploaded_file = st.sidebar.file_uploader(
-    "Carregar ficheiro ZIP/TXT (opcional se já estiver em data/raw/)",
-    type=["zip", "txt"]
-)
+with st.sidebar:
+    st.markdown("## ⚡ LusoEnergia")
+    st.caption("Gestão Comercial & Sala de Controlo")
+    st.markdown("---")
 
-fonte_dados = uploaded_file if uploaded_file is not None else encontrar_dataset()
+    pagina = st.radio(
+        "Área de Trabalho",
+        [
+            "1. Visão Geral & Faturação",
+            "2. Padrões & Perfis de Cliente",
+            "3. Previsão de Consumo",
+            "4. Sala de Controlo (Tempo Real)",
+        ],
+        label_visibility="collapsed",
+    )
+
+    st.markdown("---")
+    st.markdown("**⚙️ Perfil Contratual Simulado**")
+    tarifa_escolhida = st.selectbox(
+        "Tarifa Atual do Cliente",
+        ["Simples (0,215 €/kWh)", "Bi-Horária (0,118 € / 0,265 €)"],
+    )
+    pot_contratada = st.selectbox(
+        "Potência Contratada",
+        [3.45, 4.60, 5.75, 6.90, 10.35],
+        index=3,
+        format_func=lambda x: f"{x:.2f} kVA",
+    )
+
+    if fonte_dados is None:
+        st.markdown("---")
+        uploaded = st.file_uploader("Carregar dataset (.zip ou .txt)", type=["zip", "txt"])
+        fonte_dados = uploaded
 
 if fonte_dados is None:
-    st.error(f"⚠️ Nenhum ficheiro >1MB encontrado a partir de `{Path.cwd()}`. Carrega-o na barra lateral à esquerda.")
+    st.error("⚠️ Dataset não encontrado. Coloca o ficheiro `.zip` em `data/raw/` ou carrega-o na barra lateral.")
     st.stop()
 
 df_clean, df_diario, meta = carregar_dados_grupo(fonte_dados)
 
-st.sidebar.success(f"Janela Ativa (Grupo {SOMA_ALUNOS}):\n**{meta['inicio']}** a **{meta['fim']}**")
-st.sidebar.info(f"Carga Basal Constante (P10):\n**{meta['carga_basal_kw']:.3f} kW** ({meta['energia_basal_kwh_dia']:.2f} kWh/dia)")
+preco_kwh_ativo = TARIFA_SIMPLES if "Simples" in tarifa_escolhida else (
+    (meta["pct_vazio"] / 100.0) * TARIFA_VAZIO + (1.0 - meta["pct_vazio"] / 100.0) * TARIFA_FORA_VAZIO
+)
 
-st.title("⚡ LusoEnergia — Dashboard Operacional e Analítico")
-st.markdown("Ferramenta interativa de apoio à decisão comercial (perfilagem e previsão) e operação em tempo real (monitorização e alarmística).")
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "1. Visão Geral & Qualidade",
-    "2. Padrões & PCA",
-    "3. Previsão (Dia Seguinte)",
-    "4. Monitorização em Tempo Real"
-])
-
-# ------------------------------------------------------------------------------
-# TAB 1: VISÃO GERAL E QUALIDADE DOS DADOS
-# ------------------------------------------------------------------------------
-with tab1:
-    st.subheader("Indicadores-Chave (KPIs) da Janela de 18 Meses")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(
-        "Consumo Médio Diário",
-        f"{meta['consumo_medio_diario']:.2f} kWh/dia",
-        delta=f"Mediana: {meta['consumo_mediano_diario']:.2f} kWh/dia",
-        delta_color="off"
-    )
-    c2.metric(
-        "% de Missing (Minutos)",
-        f"{meta['pct_missing']:.2f} %",
-        delta="Interpolação até 60 min",
-        delta_color="off"
-    )
-    c3.metric(
-        "Dias Sem Leituras (0 min)",
-        f"{meta['dias_sem_leituras']} dias",
-        delta=f"{meta['dias_incompletos']} dias com < 20h válidas",
-        delta_color="inverse"
-    )
-    c4.metric(
-        "Carga Basal Constante (P10)",
-        f"{meta['energia_basal_kwh_dia']:.2f} kWh/dia",
-        delta=f"{meta['carga_basal_kw']*1000:.0f} W contínuos",
-        delta_color="off"
-    )
-
+with st.sidebar:
     st.markdown("---")
-    col_esq, col_dir = st.columns([1.6, 1.0])
+    st.caption(f"📍 Janela Grupo `{SOMA_ALUNOS}`: **{meta['inicio']}** a **{meta['fim']}**")
 
-    with col_esq:
-        st.markdown("**Evolução Diária do Consumo Total vs. Carga Basal Inevitável**")
-        fig_geral = go.Figure()
-        fig_geral.add_trace(go.Scatter(
-            x=df_diario.index, y=df_diario["Energia_Total_kWh"],
-            mode="lines", name="Consumo Diário (kWh)",
-            line=dict(color="#1f618d", width=1.4)
-        ))
-        fig_geral.add_hline(
-            y=meta["energia_basal_kwh_dia"], line_dash="dash", line_color="#c0392b",
-            annotation_text=f"Carga Basal Constante ({meta['energia_basal_kwh_dia']:.2f} kWh/dia)"
-        )
-        fig_geral.update_layout(height=370, margin=dict(l=20, r=20, t=30, b=20), yaxis_title="Energia (kWh/dia)")
-        st.plotly_chart(fig_geral, use_container_width=True)
 
-    with col_dir:
-        st.markdown("**Repartição Média de Energia por Circuito**")
-        circuitos_kwh = pd.DataFrame({
-            "Circuito": ["Climatização/Águas (Sub 3)", "Cozinha (Sub 1)", "Lavandaria (Sub 2)", "Geral & Frio (Outros)"],
-            "kWh_dia": [
-                df_diario["Sub3_Climatizacao_kWh"].mean(),
-                df_diario["Sub1_Cozinha_kWh"].mean(),
-                df_diario["Sub2_Lavandaria_kWh"].mean(),
-                df_diario["Sub_Outros_kWh"].mean()
-            ]
-        })
-        fig_pie = px.pie(
-            circuitos_kwh, names="Circuito", values="kWh_dia", hole=0.45,
-            color_discrete_sequence=["#2980b9", "#e67e22", "#16a085", "#7f8c8d"]
-        )
-        fig_pie.update_layout(height=370, margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig_pie, use_container_width=True)
+# ==============================================================================
+# PÁGINA 1: VISÃO GERAL, FATURAÇÃO & QUALIDADE DOS DADOS
+# ==============================================================================
+if pagina == "1. Visão Geral & Faturação":
+    st.title("📊 Visão Geral, Faturação & Qualidade dos Dados")
+    st.caption("Resumo executivo do consumo, custo estimado e integridade das leituras do contador inteligente.")
 
-    st.markdown("**Cobertura de Leituras Válidas por Dia (Minutos lidos / 1440)**")
-    df_cobertura = meta["leituras_por_dia"].reset_index()
-    df_cobertura.columns = ["Data", "Minutos_Validos"]
-    fig_cob = px.bar(df_cobertura, x="Data", y="Minutos_Validos", color_discrete_sequence=["#2e86c1"])
-    fig_cob.add_hline(y=1200, line_dash="dot", line_color="#c0392b", annotation_text="Limiar 20h (1200 min)")
-    fig_cob.update_layout(height=250, margin=dict(l=20, r=20, t=20, b=20), yaxis_title="Minutos/dia")
-    st.plotly_chart(fig_cob, use_container_width=True)
-
-# ------------------------------------------------------------------------------
-# TAB 2: PADRÕES DE CONSUMO & PCA
-# ------------------------------------------------------------------------------
-with tab2:
-    st.subheader("Exploração de Sazonalidade e Segmentação de Perfis Diários (PCA)")
-
-    f1, f2, f3 = st.columns([1.0, 1.2, 1.4])
-    with f1:
-        granularidade = st.selectbox(
-            "Granularidade Temporal",
-            ["Horária", "Diária", "Mensal"],
-            index=1
-        )
-    with f2:
-        mapa_vars = {
-            "Potência Ativa Global (kW)": "Global_active_power",
-            "Cozinha — Sub 1 (Wh/min)": "Sub_metering_1",
-            "Lavandaria — Sub 2 (Wh/min)": "Sub_metering_2",
-            "Climatização/Águas — Sub 3 (Wh/min)": "Sub_metering_3",
-            "Geral/Frio — Outros (Wh/min)": "Sub_outros_Wh"
-        }
-        var_label = st.selectbox("Variável / Circuito", list(mapa_vars.keys()))
-        var_col = mapa_vars[var_label]
-    with f3:
-        data_min = df_clean.index.min().date()
-        data_max = df_clean.index.max().date()
-        intervalo = st.date_input(
-            "Intervalo de Datas",
-            value=(data_min, data_max),
-            min_value=data_min,
-            max_value=data_max
-        )
-
-    if isinstance(intervalo, tuple) and len(intervalo) == 2:
-        d_ini, d_fim = intervalo
-    else:
-        d_ini, d_fim = data_min, data_max
-
-    df_filtrado = df_clean.loc[str(d_ini):str(d_fim), [var_col]]
-
-    if granularidade == "Horária":
-        serie_saz = df_filtrado.groupby(df_filtrado.index.floor("h"))[var_col].median().reset_index()
-        serie_saz.columns = ["Data_Hora", "Valor"]
-    elif granularidade == "Diária":
-        serie_saz = df_filtrado.resample("D")[var_col].mean().reset_index()
-        serie_saz.columns = ["Data_Hora", "Valor"]
-    else:
-        serie_saz = df_filtrado.groupby(df_filtrado.index.to_period("M").to_timestamp())[var_col].median().reset_index()
-        serie_saz.columns = ["Data_Hora", "Valor"]
-
-    fig_saz = px.line(
-        serie_saz, x="Data_Hora", y="Valor",
-        title=f"Série Temporal ({granularidade}) — {var_label}",
-        color_discrete_sequence=["#1f618d"]
-    )
-    if var_col == "Global_active_power":
-        fig_saz.add_hline(
-            y=meta["carga_basal_kw"], line_dash="dash", line_color="#c0392b",
-            annotation_text=f"Carga Basal P10 ({meta['carga_basal_kw']:.3f} kW)"
-        )
-    fig_saz.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20), yaxis_title=var_label, xaxis_title="Data")
-    st.plotly_chart(fig_saz, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("**Projeção PCA dos Perfis Diários de 24 Horas (Mediana Horária Robusta)**")
-
-    df_pca_base = df_clean[["Global_active_power"]].copy()
-    df_pca_base["Data"] = df_pca_base.index.date
-    df_pca_base["Hora"] = df_pca_base.index.hour
-    matriz_24h = df_pca_base.pivot_table(index="Data", columns="Hora", values="Global_active_power", aggfunc="median").dropna()
-
-    X_pca_scaled = StandardScaler().fit_transform(matriz_24h.values)
-    pca = PCA(n_components=2, random_state=42)
-    coords = pca.fit_transform(X_pca_scaled)
-    var_exp = pca.explained_variance_ratio_ * 100
-
-    datas_idx = pd.to_datetime(matriz_24h.index)
-    dias_pt = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
-    df_pca_plot = pd.DataFrame({
-        "PC1": coords[:, 0],
-        "PC2": coords[:, 1],
-        "Data": datas_idx.strftime("%Y-%m-%d"),
-        "Tipo_Dia": np.where(datas_idx.dayofweek >= 5, "Fim de Semana", "Dia Útil"),
-        "Dia_Semana": [dias_pt[d] for d in datas_idx.dayofweek],
-        "Consumo_kWh": df_diario.reindex(datas_idx)["Energia_Total_kWh"].round(2).values
-    })
-
-    fig_pca = px.scatter(
-        df_pca_plot,
-        x="PC1",
-        y="PC2",
-        color="Tipo_Dia",
-        color_discrete_map={"Dia Útil": "#2980b9", "Fim de Semana": "#e67e22"},
-        hover_data={
-            "Data": True,
-            "Tipo_Dia": True,
-            "Dia_Semana": True,
-            "Consumo_kWh": True,
-            "PC1": ":.2f",
-            "PC2": ":.2f"
-        },
-        title=f"Mapa PCA de Perfis Diários (Variância Explicada: PC1={var_exp[0]:.1f}%, PC2={var_exp[1]:.1f}%)"
-    )
-    fig_pca.update_traces(marker=dict(size=8, opacity=0.8))
-    fig_pca.update_layout(height=420, margin=dict(l=20, r=20, t=40, b=20))
-    st.plotly_chart(fig_pca, use_container_width=True)
-
-# ------------------------------------------------------------------------------
-# TAB 3: PREVISÃO (PARTE III)
-# ------------------------------------------------------------------------------
-with tab3:
-    st.subheader("Previsão do Consumo do Dia Seguinte (Validação Temporal sem Data Leakage)")
-
-    df_metricas, df_preds, freq_selecao = executar_modelo_parte3(df_diario)
-
-    m1, m2, m3 = st.columns(3)
-    mae_mod = df_metricas["MAE Modelo (kWh)"].mean()
-    mae_bas = df_metricas["MAE Baseline (kWh)"].mean()
-    melhoria = ((mae_bas - mae_mod) / mae_bas) * 100
-
-    m1.metric("MAE Médio — Modelo (LassoCV)", f"{mae_mod:.2f} kWh/dia", delta=f"{melhoria:+.1f}% vs. Baseline")
-    m2.metric("MAE Médio — Baseline (Ontem)", f"{mae_bas:.2f} kWh/dia")
-    m3.metric("R² Médio (Fora da Amostra)", f"{df_metricas['R2 Modelo'].mean():.3f}")
-
-    fig_pred = go.Figure()
-    fig_pred.add_trace(go.Scatter(
-        x=df_preds["Data"], y=df_preds["Real_kWh"],
-        mode="lines", name="Consumo Real (kWh)", line=dict(color="#2c3e50", width=1.8)
-    ))
-    fig_pred.add_trace(go.Scatter(
-        x=df_preds["Data"], y=df_preds["Previsto_Lasso_kWh"],
-        mode="lines", name="Previsto — Embedded LassoCV", line=dict(color="#e67e22", width=1.6, dash="dash")
-    ))
-    fig_pred.add_trace(go.Scatter(
-        x=df_preds["Data"], y=df_preds["Baseline_Ontem_kWh"],
-        mode="lines", name="Baseline Ingénua (Ontem)", line=dict(color="#95a5a6", width=1.1, dash="dot"),
-        visible="legendonly"
-    ))
-    fig_pred.add_hline(
-        y=meta["energia_basal_kwh_dia"], line_dash="dash", line_color="#c0392b",
-        annotation_text="Carga Basal Constante"
-    )
-    fig_pred.update_layout(
-        title="Previsão Out-of-Sample (Todos os 5 Folds Temporais)",
-        height=380, margin=dict(l=20, r=20, t=40, b=20), yaxis_title="Energia (kWh/dia)"
-    )
-    st.plotly_chart(fig_pred, use_container_width=True)
-
-    c_tab, c_vars = st.columns([1.2, 1.0])
-    with c_tab:
-        st.markdown("**Desempenho por Período Temporal (`TimeSeriesSplit`)**")
-        st.dataframe(df_metricas, use_container_width=True, hide_index=True)
-
-    with c_vars:
-        st.markdown("**Variáveis Selecionadas na Parte III (% de Folds)**")
-        vars_ativas = freq_selecao[freq_selecao > 0].reset_index()
-        vars_ativas.columns = ["Variável", "Frequência (%)"]
-        fig_vars = px.bar(
-            vars_ativas, x="Frequência (%)", y="Variável", orientation="h",
-            color_discrete_sequence=["#1f618d"]
-        )
-        fig_vars.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(autorange="reversed"))
-        st.plotly_chart(fig_vars, use_container_width=True)
-
-# ------------------------------------------------------------------------------
-# TAB 4: MONITORIZAÇÃO EM TEMPO REAL (PARTE IV — CONTROLO INTERATIVO)
-# ------------------------------------------------------------------------------
-with tab4:
-    st.subheader("Sala de Controlo: Replay Online (Welford / EWMA) & Alarme Interativo")
-
-    ctrl1, ctrl2, ctrl3 = st.columns([1.1, 1.2, 1.2])
-    with ctrl1:
-        dias_disponiveis = sorted(df_clean.index.normalize().unique())
-        dia_padrao = pd.Timestamp("2008-11-23") if pd.Timestamp("2008-11-23") in dias_disponiveis else dias_disponiveis[len(dias_disponiveis)//2]
-        dia_escolhido = st.date_input(
-            "Dia para Inspeção ao Minuto",
-            value=dia_padrao.date(),
-            min_value=dias_disponiveis[0].date(),
-            max_value=dias_disponiveis[-1].date()
-        )
-    with ctrl2:
-        janela_slider = st.slider(
-            "Tamanho da Janela Deslizante (minutos)",
-            min_value=15, max_value=180, value=60, step=15
-        )
-    with ctrl3:
-        limiar_slider = st.slider(
-            "Limiar do Z-Score para Alarme (|Z| > θ)",
-            min_value=2.0, max_value=5.5, value=3.5, step=0.25
-        )
-
-    res_stream = executar_replay_streaming(df_clean, str(dia_escolhido), janela_slider, limiar_slider)
-    df_dia_st = res_stream["df_dia"]
+    custo_medio_mensal = meta["consumo_medio_diario"] * 30.0 * preco_kwh_ativo
+    dias_excesso_pot = int((df_diario["Pico_Diario_kW"] > pot_contratada).sum())
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Média Global (Welford Online)", f"{res_stream['mean_welford']:.3f} kW")
-    k2.metric("Variância Global (Welford)", f"{res_stream['var_welford']:.3f} kW²")
+    k1.metric(
+        "Consumo Médio Diário",
+        f"{meta['consumo_medio_diario']:.2f} kWh/dia",
+        f"~{custo_medio_mensal:.2f} € / mês",
+    )
+    k2.metric(
+        "Carga Basal Permanente",
+        f"{meta['energia_basal_kwh_dia']:.2f} kWh/dia",
+        f"Custo fixo: ~{meta['energia_basal_kwh_dia']*30*preco_kwh_ativo:.2f} € / mês",
+    )
     k3.metric(
-        "Alarmes na Janela de 18 Meses",
-        f"{res_stream['total_alarmes_globais']} eventos",
-        delta=f"Janela={janela_slider}m | θ={limiar_slider}",
-        delta_color="off"
+        "% de Missing (Minutos)",
+        f"{meta['pct_missing']:.2f} %",
+        "Interpolado até 60 min",
     )
     k4.metric(
-        f"Minutos em Alarme ({dia_escolhido})",
-        f"{int(df_dia_st['Alarme'].sum())} min"
+        "Dias Sem Leituras (0 min)",
+        f"{meta['dias_sem_leituras']} dias",
+        f"{meta['dias_incompletos']} dias com < 20h válidas",
+        delta_color="inverse",
     )
 
-    fig_st = go.Figure()
-    fig_st.add_trace(go.Scatter(
-        x=df_dia_st["Timestamp"], y=df_dia_st["Bruto_kW"],
-        mode="lines", name="Leitura Bruta ao Minuto (kW)",
-        line=dict(color="#95a5a6", width=1.0), opacity=0.7
-    ))
-    fig_st.add_trace(go.Scatter(
-        x=df_dia_st["Timestamp"], y=df_dia_st["Janela_kW"],
-        mode="lines", name=f"Janela Deslizante ({janela_slider} min)",
-        line=dict(color="#1f618d", width=2.2)
-    ))
-    fig_st.add_trace(go.Scatter(
-        x=df_dia_st["Timestamp"], y=df_dia_st["EWMA_kW"],
-        mode="lines", name="EWMA Online",
-        line=dict(color="#d35400", width=2.0, dash="dash")
-    ))
-
-    df_pts_alarme = df_dia_st[df_dia_st["Alarme"]]
-    if not df_pts_alarme.empty:
-        fig_st.add_trace(go.Scatter(
-            x=df_pts_alarme["Timestamp"], y=df_pts_alarme["Bruto_kW"],
-            mode="markers", name="Alarme Disparado (|Z| > θ)",
-            marker=dict(color="#c0392b", size=9, symbol="x")
-        ))
-
-    fig_st.update_layout(
-        title=f"Replay em Tempo Real ({dia_escolhido}) — Efeito da Janela e do Limiar Z-Score",
-        height=400, margin=dict(l=20, r=20, t=40, b=20),
-        yaxis_title="Potência Ativa (kW)", xaxis_title="Hora"
-    )
-    st.plotly_chart(fig_st, use_container_width=True)
-
-    if not res_stream["alarmes_dia"].empty:
-        with st.expander(f"Ver lista detalhada dos {len(res_stream['alarmes_dia'])} minutos com alarme neste dia"):
-            st.dataframe(res_stream["alarmes_dia"], use_container_width=True, hide_index=True)
+    if meta["poupanca_anual_bihoraria"] > 15 and "Simples" in tarifa_escolhida:
+        st.success(
+            f"💡 **Oportunidade Comercial:** Este cliente realiza **{meta['pct_vazio']:.1f}%** do consumo em horário vazio (22h–08h). "
+            f"A mudança para **Tarifa Bi-Horária** gera uma poupança estimada de **{meta['poupanca_anual_bihoraria']:.2f} €/ano**."
+        )
+    elif dias_excesso_pot > 0:
+        st.warning(
+            f"⚠️ **Alerta de Potência Contratada ({pot_contratada:.2f} kVA):** Foram registados picos acima da potência contratada em **{dias_excesso_pot} dias**. "
+            "Recomenda-se propor subida de escalão ou gestão de cargas."
+        )
     else:
-        st.info("Nenhum alarme disparado neste dia com os parâmetros atuais.")
+        st.info(
+            f"✅ **Enquadramento Tarifário:** Consumo em vazio de **{meta['pct_vazio']:.1f}%**. "
+            f"A potência contratada de **{pot_contratada:.2f} kVA** suporta todos os picos registados sem risco de disparo."
+        )
+
+    with st.container(border=True):
+        col_t1, col_t2 = st.columns([3, 1])
+        with col_t1:
+            st.subheader("Evolução Diária do Consumo e Faturação")
+        with col_t2:
+            unidade_v1 = st.selectbox("Unidade:", ["Energia (kWh/dia)", "Custo Estimado (€/dia)", "Decomposição por Circuito"], label_visibility="collapsed")
+
+        fig1 = go.Figure()
+        if unidade_v1 == "Energia (kWh/dia)":
+            fig1.add_trace(go.Scatter(
+                x=df_diario.index, y=df_diario["Energia_Total_kWh"],
+                mode="lines", name="Consumo Diário (kWh)",
+                line=dict(color="#1f618d", width=1.6), fill="tozeroy", fillcolor="rgba(31, 97, 141, 0.10)",
+            ))
+            fig1.add_hline(y=meta["energia_basal_kwh_dia"], line_dash="dash", line_color="#c0392b", annotation_text="Carga Basal")
+            y_label = "Energia (kWh/dia)"
+        elif unidade_v1 == "Custo Estimado (€/dia)":
+            fig1.add_trace(go.Scatter(
+                x=df_diario.index, y=df_diario["Energia_Total_kWh"] * preco_kwh_ativo,
+                mode="lines", name="Custo Diário (€)",
+                line=dict(color="#117864", width=1.6), fill="tozeroy", fillcolor="rgba(17, 120, 100, 0.10)",
+            ))
+            fig1.add_hline(y=meta["energia_basal_kwh_dia"] * preco_kwh_ativo, line_dash="dash", line_color="#c0392b", annotation_text="Custo Basal")
+            y_label = "Custo (€/dia)"
+        else:
+            for nome, col, cor in [
+                ("Climatização & Águas (Sub 3)", "Sub3_Climatizacao_kWh", "#2980b9"),
+                ("Geral & Frigorífico (Outros)", "Sub_Outros_kWh", "#7f8c8d"),
+                ("Cozinha (Sub 1)", "Sub1_Cozinha_kWh", "#e67e22"),
+                ("Lavandaria (Sub 2)", "Sub2_Lavandaria_kWh", "#16a085"),
+            ]:
+                fig1.add_trace(go.Scatter(
+                    x=df_diario.index, y=df_diario[col],
+                    mode="lines", name=nome, stackgroup="one", line=dict(width=0.8, color=cor),
+                ))
+            y_label = "Energia (kWh/dia)"
+
+        fig1.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_title=y_label, hovermode="x unified")
+        st.plotly_chart(fig1, use_container_width=True)
+
+    c_esq, c_dir = st.columns([1.45, 1.0])
+    with c_esq:
+        with st.container(border=True):
+            st.subheader("Integridade das Leituras por Dia")
+            df_cob = meta["leituras_dia"].reset_index()
+            df_cob.columns = ["Data", "Minutos"]
+            df_cob["Estado"] = np.where(df_cob["Minutos"] == 0, "Sem Leituras (0 min)",
+                               np.where(df_cob["Minutos"] < 1200, "Incompleto (< 20h)", "Completo (≥ 20h)"))
+            fig_cob = px.bar(
+                df_cob, x="Data", y="Minutos", color="Estado",
+                color_discrete_map={"Completo (≥ 20h)": "#2e86c1", "Incompleto (< 20h)": "#f39c12", "Sem Leituras (0 min)": "#c0392b"},
+            )
+            fig_cob.update_layout(height=270, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Minutos / Dia")
+            st.plotly_chart(fig_cob, use_container_width=True)
+
+    with c_dir:
+        with st.container(border=True):
+            st.subheader("Distribuição da Fatura por Circuito")
+            df_pie = pd.DataFrame({
+                "Circuito": ["Climatização (Sub 3)", "Geral & Frio (Outros)", "Cozinha (Sub 1)", "Lavandaria (Sub 2)"],
+                "Euros_Mes": [
+                    df_diario["Sub3_Climatizacao_kWh"].mean() * 30 * preco_kwh_ativo,
+                    df_diario["Sub_Outros_kWh"].mean() * 30 * preco_kwh_ativo,
+                    df_diario["Sub1_Cozinha_kWh"].mean() * 30 * preco_kwh_ativo,
+                    df_diario["Sub2_Lavandaria_kWh"].mean() * 30 * preco_kwh_ativo,
+                ],
+            })
+            fig_pie = px.pie(df_pie, names="Circuito", values="Euros_Mes", hole=0.5,
+                             color_discrete_sequence=["#2980b9", "#7f8c8d", "#e67e22", "#16a085"])
+            fig_pie.update_traces(texttemplate="%{label}<br>%{value:.1f} €/mês")
+            fig_pie.update_layout(height=270, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+
+# ==============================================================================
+# PÁGINA 2: PADRÕES DE CONSUMO & PERFIS DE CLIENTE (PCA / t-SNE)
+# ==============================================================================
+elif pagina == "2. Padrões & Perfis de Cliente":
+    st.title("📈 Padrões de Consumo & Perfis de Cliente")
+    st.caption("Análise de sazonalidade e segmentação dos hábitos diários (Dia Útil vs. Fim de Semana).")
+
+    with st.container(border=True):
+        f1, f2, f3 = st.columns([1.0, 1.3, 1.3])
+        with f1:
+            granularidade = st.radio("Granularidade", ["Horária", "Diária", "Mensal"], horizontal=True, index=1)
+        with f2:
+            opcoes_vars = {
+                "Potência Ativa Global (kW)": "Global_active_power",
+                "Climatização / Águas — Sub 3 (Wh/min)": "Sub_metering_3",
+                "Cozinha — Sub 1 (Wh/min)": "Sub_metering_1",
+                "Lavandaria — Sub 2 (Wh/min)": "Sub_metering_2",
+                "Geral / Frigorífico — Outros (Wh/min)": "Sub_outros_Wh",
+            }
+            var_nome = st.selectbox("Variável / Circuito", list(opcoes_vars.keys()))
+            var_col = opcoes_vars[var_nome]
+        with f3:
+            d_min, d_max = df_clean.index.min().date(), df_clean.index.max().date()
+            datas = st.date_input("Intervalo de Datas", value=(d_min, d_max), min_value=d_min, max_value=d_max)
+
+        d_ini, d_fim = datas if (isinstance(datas, tuple) and len(datas) == 2) else (d_min, d_max)
+        df_sub = df_clean.loc[str(d_ini):str(d_fim), [var_col]]
+
+        if granularidade == "Horária":
+            serie = df_sub.groupby(df_sub.index.floor("h"))[var_col].median().reset_index()
+        elif granularidade == "Diária":
+            serie = df_sub.resample("D")[var_col].mean().reset_index()
+        else:
+            serie = df_sub.groupby(df_sub.index.to_period("M").to_timestamp())[var_col].median().reset_index()
+        serie.columns = ["Data", "Valor"]
+
+        fig_saz = px.line(serie, x="Data", y="Valor", color_discrete_sequence=["#1f618d"])
+        if var_col == "Global_active_power":
+            fig_saz.add_hline(y=meta["carga_basal_kw"], line_dash="dash", line_color="#c0392b", annotation_text="Carga Basal")
+        fig_saz.update_layout(
+            title=f"Evolução ({granularidade}) — {var_nome}",
+            height=320, margin=dict(l=10, r=10, t=40, b=10), yaxis_title=var_nome, xaxis_title="",
+        )
+        st.plotly_chart(fig_saz, use_container_width=True)
+
+    col_pca, col_curva = st.columns([1.3, 1.0])
+
+    with col_pca:
+        with st.container(border=True):
+            c_top1, c_top2 = st.columns([1.35, 1.0])
+            with c_top1:
+                st.subheader("Mapa de Perfis Diários (24h)")
+            with c_top2:
+                metodo_proj = st.radio(
+                    "Método de Projeção",
+                    ["PCA", "t-SNE"],
+                    horizontal=True,
+                    label_visibility="collapsed",
+                )
+
+            if metodo_proj == "t-SNE":
+                perp_val = st.slider(
+                    "Perplexity t-SNE (vizinhos locais por grupo)",
+                    min_value=10, max_value=50, value=30, step=5,
+                )
+                st.caption("t-SNE agrupa dias com rotinas semelhantes em ilhas locais. Passe o rato para ver a data e tipo de dia.")
+            else:
+                perp_val = 30
+                st.caption("PCA (padrão): Componente 1 reflete o volume de consumo e Componente 2 a distribuição horária.")
+
+            df_proj, mat_24h, tipo_dia, eixo_x, eixo_y = calcular_projecao_2d(
+                df_clean, df_diario, metodo=metodo_proj, perplexity=perp_val
+            )
+
+            fig_pca = px.scatter(
+                df_proj, x="Dim1", y="Dim2", color="Tipo de Dia",
+                color_discrete_map={"Dia Útil": "#2980b9", "Fim de Semana": "#e67e22"},
+                hover_data={
+                    "Data": True,
+                    "Tipo de Dia": True,
+                    "Dia da Semana": True,
+                    "Consumo (kWh)": True,
+                    "Dim1": ":.2f",
+                    "Dim2": ":.2f",
+                },
+            )
+            fig_pca.update_traces(marker=dict(size=8, opacity=0.82))
+            fig_pca.update_layout(
+                height=320 if metodo_proj == "t-SNE" else 355,
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis_title=eixo_x,
+                yaxis_title=eixo_y,
+            )
+            st.plotly_chart(fig_pca, use_container_width=True)
+
+    with col_curva:
+        with st.container(border=True):
+            st.subheader("Curva Horária Típica (24h)")
+            st.caption("Consumo típico ao longo do dia (zona sombreada = horário vazio).")
+            mat_24h_tipo = mat_24h.copy()
+            mat_24h_tipo["Tipo de Dia"] = tipo_dia
+            perfis_medios = mat_24h_tipo.groupby("Tipo de Dia").median().T.reset_index()
+            perfis_melt = perfis_medios.melt(id_vars="Hora", var_name="Tipo de Dia", value_name="Potência (kW)")
+
+            fig_hora = px.line(
+                perfis_melt, x="Hora", y="Potência (kW)", color="Tipo de Dia", markers=True,
+                color_discrete_map={"Dia Útil": "#2980b9", "Fim de Semana": "#e67e22"},
+            )
+            fig_hora.add_vrect(x0=0, x1=8, fillcolor="green", opacity=0.07, line_width=0)
+            fig_hora.add_vrect(x0=22, x1=23, fillcolor="green", opacity=0.07, line_width=0)
+            fig_hora.update_layout(height=355, margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(dtick=3))
+            st.plotly_chart(fig_hora, use_container_width=True)
+
+
+# ==============================================================================
+# PÁGINA 3: PREVISÃO DO DIA SEGUINTE
+# ==============================================================================
+elif pagina == "3. Previsão de Consumo":
+    st.title("🔮 Previsão de Compra de Energia (Dia Seguinte)")
+    st.caption("Estimativa diária para planeamento de compra de energia no mercado grossista.")
+
+    df_metricas, df_preds, df_vars = executar_modelo_parte3(df_diario)
+
+    c_f1, c_f2 = st.columns([1.2, 1.8])
+    with c_f1:
+        periodo_sel = st.selectbox(
+            "Período de Avaliação",
+            ["Todos os Períodos (Global)"] + df_metricas["Período"].tolist(),
+        )
+    with c_f2:
+        mostrar_baseline = st.checkbox("Comparar com Referência Ingénua (Repetir Consumo de Ontem)", value=True)
+
+    if periodo_sel == "Todos os Períodos (Global)":
+        df_preds_view = df_preds
+        mae_mod = df_metricas["MAE Modelo (kWh)"].mean()
+        mae_bas = df_metricas["MAE Baseline (kWh)"].mean()
+        rmse_mod = df_metricas["RMSE (kWh)"].mean()
+        r2_mod = df_metricas["R²"].mean()
+    else:
+        df_preds_view = df_preds[df_preds["Período"] == periodo_sel]
+        linha_m = df_metricas[df_metricas["Período"] == periodo_sel].iloc[0]
+        mae_mod = linha_m["MAE Modelo (kWh)"]
+        mae_bas = linha_m["MAE Baseline (kWh)"]
+        rmse_mod = linha_m["RMSE (kWh)"]
+        r2_mod = linha_m["R²"]
+
+    ganho_pct = ((mae_bas - mae_mod) / mae_bas) * 100.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Desvio Médio (MAE Modelo)", f"{mae_mod:.2f} kWh/dia", f"{ganho_pct:+.1f}% vs. Referência")
+    m2.metric("Impacto Financeiro do Desvio", f"±{mae_mod * preco_kwh_ativo:.2f} € / dia", f"Ref.: ±{mae_bas * preco_kwh_ativo:.2f} € / dia", delta_color="off")
+    m3.metric("Erro Quadrático (RMSE)", f"{rmse_mod:.2f} kWh/dia")
+    m4.metric("Qualidade de Ajuste (R²)", f"{r2_mod:.3f}")
+
+    with st.container(border=True):
+        fig_pred = go.Figure()
+        fig_pred.add_trace(go.Scatter(
+            x=df_preds_view["Data"], y=df_preds_view["Real_kWh"],
+            mode="lines", name="Consumo Real (kWh)", line=dict(color="#1c2833", width=2.0),
+        ))
+        fig_pred.add_trace(go.Scatter(
+            x=df_preds_view["Data"], y=df_preds_view["Previsto_kWh"],
+            mode="lines", name="Previsão Modelo LusoEnergia", line=dict(color="#e67e22", width=1.9, dash="dash"),
+        ))
+        if mostrar_baseline:
+            fig_pred.add_trace(go.Scatter(
+                x=df_preds_view["Data"], y=df_preds_view["Baseline_kWh"],
+                mode="lines", name="Referência (Ontem)", line=dict(color="#95a5a6", width=1.2, dash="dot"),
+            ))
+        fig_pred.add_hline(y=meta["energia_basal_kwh_dia"], line_dash="dash", line_color="#c0392b", annotation_text="Carga Basal")
+        fig_pred.update_layout(
+            title=f"Consumo Real vs. Previsto ({periodo_sel})",
+            height=350, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Energia (kWh/dia)", hovermode="x unified",
+        )
+        st.plotly_chart(fig_pred, use_container_width=True)
+
+    col_err, col_vars = st.columns([1.25, 1.0])
+    with col_err:
+        with st.container(border=True):
+            st.subheader("Erro de Previsão por Período")
+            fig_err = go.Figure()
+            fig_err.add_trace(go.Bar(x=df_metricas["Período"], y=df_metricas["MAE Modelo (kWh)"], name="Modelo LusoEnergia", marker_color="#1f618d"))
+            fig_err.add_trace(go.Bar(x=df_metricas["Período"], y=df_metricas["MAE Baseline (kWh)"], name="Referência (Ontem)", marker_color="#bdc3c7"))
+            fig_err.update_layout(barmode="group", height=230, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="MAE (kWh/dia)")
+            st.plotly_chart(fig_err, use_container_width=True)
+            st.dataframe(df_metricas[["Período", "Datas", "MAE Modelo (kWh)", "MAE Baseline (kWh)", "R²"]], use_container_width=True, hide_index=True)
+
+    with col_vars:
+        with st.container(border=True):
+            st.subheader("Indicadores Selecionados (Parte III)")
+            st.caption("Variáveis com maior peso na previsão diária.")
+            df_vars_ativas = df_vars[df_vars["Importância (%)"] > 0]
+            fig_v = px.bar(
+                df_vars_ativas, x="Importância (%)", y="Variável", orientation="h",
+                color_discrete_sequence=["#2e86c1"],
+            )
+            fig_v.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(autorange="reversed"), xaxis=dict(range=[0, 105]))
+            st.plotly_chart(fig_v, use_container_width=True)
+
+
+# ==============================================================================
+# PÁGINA 4: SALA DE CONTROLO — MONITORIZAÇÃO EM TEMPO REAL
+# ==============================================================================
+elif pagina == "4. Sala de Controlo (Tempo Real)":
+    st.title("🚨 Sala de Controlo: Monitorização em Tempo Real")
+    st.caption("Deteção online de picos anómalos (Welford / EWMA / Z-Score) com diagnóstico automático de circuito.")
+
+    p1, p2, p3, _ = st.columns([1, 1, 1, 1.4])
+    if p1.button("Modo Sensível (30m | Z=2.5)", use_container_width=True):
+        st.session_state["win_slider"] = 30
+        st.session_state["z_slider"] = 2.5
+    if p2.button("Modo Padrão (60m | Z=3.5)", use_container_width=True):
+        st.session_state["win_slider"] = 60
+        st.session_state["z_slider"] = 3.5
+    if p3.button("Modo Recomendado (120m | Z=3.5)", use_container_width=True):
+        st.session_state["win_slider"] = 120
+        st.session_state["z_slider"] = 3.5
+
+    if "win_slider" not in st.session_state:
+        st.session_state["win_slider"] = 120
+    if "z_slider" not in st.session_state:
+        st.session_state["z_slider"] = 3.5
+
+    with st.container(border=True):
+        c_s1, c_s2 = st.columns(2)
+        with c_s1:
+            janela_val = st.slider(
+                "Janela de Referência Deslizante (minutos)",
+                min_value=15, max_value=180, step=15, key="win_slider",
+            )
+        with c_s2:
+            limiar_val = st.slider(
+                "Sensibilidade do Alarme — Limiar Z-Score (Z > θ)",
+                min_value=2.0, max_value=5.5, step=0.25, key="z_slider",
+            )
+
+    dias_disp = sorted(df_clean.index.normalize().unique())
+    dia_default = str(dias_disp[len(dias_disp) // 2].date())
+    res_meta = executar_replay_streaming(df_clean, dia_default, janela_val, limiar_val, pot_contratada)
+
+    col_d1, col_d2 = st.columns([1.2, 1.5])
+    with col_d1:
+        modo_dia = st.radio(
+            "Seleção do Dia de Operação",
+            ["Saltar para dias com alarmes", "Escolher data no calendário"],
+            horizontal=True,
+        )
+    with col_d2:
+        if modo_dia == "Saltar para dias com alarmes" and len(res_meta["dias_com_alarme"]) > 0:
+            dia_sel_str = st.selectbox(
+                f"Dias com eventos detetados ({len(res_meta['dias_com_alarme'])} dias):",
+                res_meta["dias_com_alarme"],
+            )
+        else:
+            dia_dt = st.date_input(
+                "Data para inspeção ao minuto:",
+                value=dias_disp[len(dias_disp) // 2].date(),
+                min_value=dias_disp[0].date(),
+                max_value=dias_disp[-1].date(),
+            )
+            dia_sel_str = str(dia_dt)
+
+    res = executar_replay_streaming(df_clean, dia_sel_str, janela_val, limiar_val, pot_contratada)
+    df_dia_st = res["df_dia"]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Eventos de Alarme (18 Meses)", f"{res['total_eventos']} eventos", f"Média: {res['total_eventos']/18:.1f} / mês", delta_color="off")
+    k2.metric(f"Minutos em Alerta ({dia_sel_str})", f"{int(df_dia_st['Alarme'].sum())} min")
+    k3.metric("Potência Média Global (Welford)", f"{res['mean_welford']:.3f} kW")
+    k4.metric("Variância Global (Welford)", f"{res['var_welford']:.3f} kW²")
+
+    with st.container(border=True):
+        fig_st = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+            row_heights=[0.70, 0.30],
+            subplot_titles=(
+                f"Monitorização em Tempo Real ({dia_sel_str}) — Potência Instantânea vs. Tendência",
+                f"Indicador de Anomalia (Z-Score Positivo > {limiar_val})",
+            ),
+        )
+
+        fig_st.add_trace(go.Scatter(
+            x=df_dia_st["Timestamp"], y=df_dia_st["Bruto_kW"],
+            mode="lines", name="Potência Instantânea (kW)", line=dict(color="#95a5a6", width=1.0), opacity=0.65,
+        ), row=1, col=1)
+        fig_st.add_trace(go.Scatter(
+            x=df_dia_st["Timestamp"], y=df_dia_st["Janela_kW"],
+            mode="lines", name=f"Média Deslizante ({janela_val} min)", line=dict(color="#1f618d", width=2.2),
+        ), row=1, col=1)
+        fig_st.add_trace(go.Scatter(
+            x=df_dia_st["Timestamp"], y=df_dia_st["EWMA_kW"],
+            mode="lines", name="Tendência Rápida (EWMA)", line=dict(color="#d35400", width=2.0, dash="dash"),
+        ), row=1, col=1)
+
+        fig_st.add_hline(
+            y=pot_contratada, line_dash="dot", line_color="#8e44ad",
+            annotation_text=f"Pot. Contratada ({pot_contratada:.2f} kVA)", row=1, col=1,
+        )
+
+        pts_alarme = df_dia_st[df_dia_st["Alarme"]]
+        if not pts_alarme.empty:
+            fig_st.add_trace(go.Scatter(
+                x=pts_alarme["Timestamp"], y=pts_alarme["Bruto_kW"],
+                mode="markers", name="Alarme Disparado",
+                text=pts_alarme["Causa"],
+                hovertemplate="<b>%{x|%H:%M}</b><br>Potência: %{y:.2f} kW<br>%{text}<extra></extra>",
+                marker=dict(color="#c0392b", size=9, symbol="x"),
+            ), row=1, col=1)
+
+        fig_st.add_trace(go.Scatter(
+            x=df_dia_st["Timestamp"], y=df_dia_st["Z_Score"],
+            mode="lines", name="Z-Score", line=dict(color="#5b2c6f", width=1.4), showlegend=False,
+        ), row=2, col=1)
+        fig_st.add_hline(y=limiar_val, line_dash="dot", line_color="#c0392b", row=2, col=1)
+
+        fig_st.update_yaxes(title_text="Potência (kW)", row=1, col=1)
+        fig_st.update_yaxes(title_text="Z-Score", row=2, col=1)
+        fig_st.update_layout(height=520, margin=dict(l=10, r=10, t=35, b=10), hovermode="x unified")
+        st.plotly_chart(fig_st, use_container_width=True)
+
+    if not res["tabela_alarmes_dia"].empty:
+        st.subheader(f"📋 Diagnóstico dos {len(res['tabela_alarmes_dia'])} Minutos em Alarme ({dia_sel_str})")
+        st.dataframe(res["tabela_alarmes_dia"], use_container_width=True, hide_index=True)
+    else:
+        st.info("Nenhum pico anómalo registado neste dia com os parâmetros atuais.")

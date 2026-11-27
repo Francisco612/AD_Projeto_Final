@@ -8,7 +8,7 @@ import matplotlib.dates as mdates
 try:
     from river.drift import ADWIN
 except ImportError as exc:
-    raise ImportError("A biblioteca 'river' não está instalada. Corre: pip install river") from exc
+    raise ImportError("A biblioteca 'river' não está instalada. Executa: pip install river") from exc
 
 
 def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=0.002):
@@ -46,9 +46,9 @@ def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=
 
     # 5. Estado do alarme Z-Score em janela
     alarmes = []
-    ultimo_alarme_ts = None  # cooldown de 60 min para registar eventos independentes
+    ultimo_alarme_ts = None  # Cooldown de 60 min para registar eventos distintos
 
-    # Buffers para guardar as séries online apenas para visualização posterior
+    # Buffers de saída apenas para visualização posterior
     ts_validos = []
     serie_bruta = []
     serie_janela = []
@@ -58,7 +58,7 @@ def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=
     t0 = time.perf_counter()
 
     # =========================================================================
-    # LOOP ELEMENTO A ELEMENTO (PROIBIDO OLHAR PARA O ARRAY COMPLETO AQUI)
+    # CICLO ELEMENTO A ELEMENTO (PROIBIDO OLHAR PARA O ARRAY COMPLETO AQUI)
     # =========================================================================
     for ts, x in zip(timestamps, valores):
         if np.isnan(x):
@@ -66,12 +66,12 @@ def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=
 
         ts_pd = pd.Timestamp(ts)
 
-        # --- A. Alarme Z-Score avaliado ANTES de atualizar a janela ---
+        # --- A. Alarme Z-Score avaliado ANTES de atualizar a janela (sem contaminação) ---
         z_score = 0.0
-        if len(janela) >= 30:
+        if len(janela) >= max(15, janela_min // 2):
             mu_local = soma_janela / len(janela)
             var_local = sum((v - mu_local) ** 2 for v in janela) / (len(janela) - 1)
-            std_local = max(np.sqrt(var_local), 0.015)  # piso numérico mínimo
+            std_local = max(np.sqrt(var_local), 0.015)  # Piso numérico mínimo
             z_score = (x - mu_local) / std_local
 
             if abs(z_score) > limiar_z:
@@ -85,21 +85,21 @@ def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=
                     })
                     ultimo_alarme_ts = ts_pd
 
-        # --- B. Welford Online ---
+        # --- B. Atualização de Welford Online ---
         n_welford += 1
         delta = x - mean_welford
         mean_welford += delta / n_welford
         delta2 = x - mean_welford
         m2_welford += delta * delta2
 
-        # --- C. Janela Deslizante de 60 min (O(1)) ---
+        # --- C. Atualização da Janela Deslizante (O(1)) ---
         if len(janela) == janela_min:
             soma_janela -= janela[0]
         janela.append(x)
         soma_janela += x
         media_janela_atual = soma_janela / len(janela)
 
-        # --- D. EWMA Online ---
+        # --- D. Atualização da EWMA Online ---
         if ewma_atual is None:
             ewma_atual = float(x)
         else:
@@ -126,7 +126,7 @@ def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=
             buffer_15m = []
             ts_inicio_15m = None
 
-        # Guardar outputs do passo atual
+        # Registar outputs do instante atual
         ts_validos.append(ts_pd)
         serie_bruta.append(float(x))
         serie_janela.append(float(media_janela_atual))
@@ -137,7 +137,7 @@ def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=
     var_welford = m2_welford / (n_welford - 1)
 
     # =========================================================================
-    # VERIFICAÇÃO WELFORD VS. BATCH (ÚNICO MOMENTO EM QUE SE USA O ARRAY TODO)
+    # VERIFICAÇÃO WELFORD VS. BATCH (ÚNICO USO DO ARRAY COMPLETO)
     # =========================================================================
     arr_batch = np.array(serie_bruta, dtype=float)
     mean_batch = float(np.mean(arr_batch))
@@ -169,8 +169,12 @@ def processar_fluxo_tempo_real(df_min, janela_min=60, limiar_z=3.5, delta_adwin=
     return df_stream, df_15m, pd.DataFrame(drifts), pd.DataFrame(alarmes), resumo_welford
 
 
-def plot_comparacao_dia_4_1(df_stream, dia_str="2008-11-23", alpha_ewma=0.0328):
+def plot_comparacao_dia_4_1(df_stream, dia_str=None, alpha_ewma=0.0328):
     """Figura 4.1: Leitura Bruta vs. Janela Deslizante 60 min vs. EWMA num dia interessante."""
+    if dia_str is None or dia_str not in df_stream.index.strftime("%Y-%m-%d").unique():
+        # Escolhe automaticamente o dia com maior pico de potência na janela do grupo
+        dia_str = str(df_stream["Bruto_kW"].idxmax().date())
+
     df_dia = df_stream.loc[dia_str]
 
     fig, ax = plt.subplots(figsize=(14, 4.8))
@@ -181,7 +185,7 @@ def plot_comparacao_dia_4_1(df_stream, dia_str="2008-11-23", alpha_ewma=0.0328):
     ax.plot(df_dia.index, df_dia["EWMA_kW"], color="#d35400", linestyle="--", linewidth=2.0,
             label=f"EWMA Online (α = {alpha_ewma:.4f})")
 
-    ax.set_title(f"Figura 10 (4.1) — Replay em Tempo Real ({dia_str}): Bruto vs. Janela 60 min vs. EWMA",
+    ax.set_title(f"4.1 Replay em Tempo Real ({dia_str}): Bruto vs. Janela 60 min vs. EWMA",
                  fontsize=12, fontweight="bold", loc="left", pad=10)
     ax.set_ylabel("Potência Ativa (kW)")
     ax.set_xlabel("Hora do Dia")
@@ -200,7 +204,7 @@ def plot_drift_adwin_4_2(df_15m, df_drifts):
         ax.scatter(df_drifts["Timestamp"], df_drifts["Media_15m_kW"], color="#c0392b", s=28, zorder=5,
                    label=f"Drift Detetado pelo ADWIN (n = {len(df_drifts)})")
 
-    ax.set_title("Figura 11 (4.2) — Deteção de Concept Drift com ADWIN (River) nos 18 Meses",
+    ax.set_title("4.2 Deteção de Concept Drift com ADWIN (River) nos 18 Meses",
                  fontsize=12, fontweight="bold", loc="left", pad=10)
     ax.set_ylabel("Potência Média 15 min (kW)")
     ax.set_xlabel("Data")
@@ -209,7 +213,7 @@ def plot_drift_adwin_4_2(df_15m, df_drifts):
     plt.show()
 
 
-def inspecionar_5_alarmes(df_min, df_alarmes, df_stream, janela_min=60, limiar_z=3.5):
+def inspecionar_5_alarmes(df_min, df_alarmes, df_stream):
     """Seleciona 5 alarmes representativos, enriquece com contexto físico e desenha zoom."""
     if len(df_alarmes) == 0:
         return pd.DataFrame()
@@ -222,9 +226,8 @@ def inspecionar_5_alarmes(df_min, df_alarmes, df_stream, janela_min=60, limiar_z
         ts = row["Timestamp"]
         reg = df_min.loc[ts]
 
-        # Critério objetivo de diagnóstico para apoiar a avaliação qualitativa
         if row["Potencia_kW"] < 1.5 and row["Std_Janela_kW"] < 0.08:
-            diagnostico = "FALSO ALARME (ciclo normal de frio sobre janela muito calma / std colapsado)"
+            diagnostico = "FALSO ALARME (ciclo normal de frio sobre janela calma / std colapsado)"
         elif row["Potencia_kW"] >= 3.35 and (reg["Sub_metering_1"] > 0 or reg["Sub_metering_2"] > 0 or reg["Sub_metering_3"] > 0):
             diagnostico = "ALARME REAL (pico elevado com disparo simultâneo de eletrodomésticos)"
         else:
@@ -247,7 +250,6 @@ def inspecionar_5_alarmes(df_min, df_alarmes, df_stream, janela_min=60, limiar_z
 
     df_5 = pd.DataFrame(registos)
 
-    # Gráfico de zoom (2h antes até 1h depois) para os 5 alarmes
     n_plots = len(df_5)
     fig, axes = plt.subplots(1, n_plots, figsize=(3.6 * n_plots, 3.8), sharey=False)
     if n_plots == 1:
